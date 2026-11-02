@@ -1,0 +1,9 @@
+{
+  "name": "Ada Okafor",
+  "email": "ada.okafor@example.com",
+  "phone": "+2348012345678",
+  "service": "Strategy call",
+  "start": "2026-11-20T14:00:00+01:00",
+  "durationMins": 45,
+  "timezone": "Africa/Lagos"
+}

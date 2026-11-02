@@ -1,0 +1,396 @@
+{
+  "name": "Appointments: Reminders",
+  "nodes": [
+    {
+      "id": "n101",
+      "name": "Every 15 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "n102",
+      "name": "Upcoming Appointments (25h)",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [
+        220,
+        300
+      ],
+      "parameters": {
+        "operation": "search",
+        "base": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $env.AIRTABLE_BASE_ID }}"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $env.AIRTABLE_APPOINTMENTS_TABLE_ID }}"
+        },
+        "filterByFormula": "AND({Status} = 'Confirmed', IS_AFTER({Start}, NOW()), IS_BEFORE({Start}, DATEADD(NOW(), 25, 'hours')))",
+        "returnAll": true,
+        "options": {}
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "REPLACE_ME",
+          "name": "Airtable account"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "n103",
+      "name": "Decide Reminders",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// ---- logic from code/reminders-due.js (unit tested in test/) ----\n// Decides which reminder, if any, each appointment needs right now.\n//\n// Pure function: unit tested in test/, injected verbatim into the\n// \"Decide Reminders\" Code node by scripts/build-workflows.js.\n//\n// The scheduler runs every 15 minutes, so reminders are driven by flags\n// rather than exact times: \"is this appointment inside the window, and has\n// this reminder not been sent yet?\" That makes it safe to run late, run twice,\n// or miss a run: nothing is sent twice and nothing is skipped silently.\n//\n// Rules\n//   - Only Confirmed appointments that have not started get reminders.\n//   - Inside 1 hour of start:  send the 1h reminder (once). If the 24h\n//     reminder was never sent, it is marked as skipped, not sent late: two\n//     reminders minutes apart is noise.\n//   - Inside 24 hours of start: send the 24h reminder (once), unless the\n//     appointment was booked less than 24 hours ahead. In that case the\n//     booking confirmation just went out and a \"see you tomorrow\" email\n//     minutes later is redundant.\n\nconst HOUR = 3600000;\n\nfunction remindersDue(appointments, now) {\n  const t = now.getTime();\n  const due = [];\n\n  for (const a of appointments || []) {\n    if (!a || a.status !== 'Confirmed' || !a.start) continue;\n    const start = new Date(a.start).getTime();\n    if (isNaN(start)) continue;\n    const msUntil = start - t;\n    if (msUntil <= 0) continue;\n\n    const sent24 = Boolean(a.reminder24hSent);\n    const sent1h = Boolean(a.reminder1hSent);\n    const created = a.createdAt ? new Date(a.createdAt).getTime() : NaN;\n    const bookedLate = !isNaN(created) && start - created < 24 * HOUR;\n\n    if (msUntil <= HOUR) {\n      if (!sent1h) {\n        due.push({ ...a, kind: '1h', setReminder24hSent: true, setReminder1hSent: true });\n      }\n      continue;\n    }\n\n    if (msUntil <= 24 * HOUR && !sent24) {\n      if (bookedLate) {\n        // Nothing to send, but record the decision so this is not re-evaluated every run.\n        due.push({ ...a, kind: 'skip-24h', setReminder24hSent: true, setReminder1hSent: sent1h });\n      } else {\n        due.push({ ...a, kind: '24h', setReminder24hSent: true, setReminder1hSent: sent1h });\n      }\n    }\n  }\n\n  return due;\n}\n\n/** Human-readable local time for messages, in the client's own timezone. */\nfunction formatLocal(iso, timeZone) {\n  return new Intl.DateTimeFormat('en-GB', {\n    timeZone: timeZone || 'Africa/Lagos',\n    weekday: 'long',\n    day: 'numeric',\n    month: 'long',\n    hour: 'numeric',\n    minute: '2-digit',\n    hour12: true,\n    timeZoneName: 'short',\n  }).format(new Date(iso));\n}\n\n// ---- n8n wrapper ----\nconst appointments = $input.all()\n  .filter((i) => i.json.id)\n  .map((i) => ({\n    recordId: i.json.id,\n    appointmentId: i.json['Appointment ID'],\n    name: i.json.Name,\n    email: i.json.Email,\n    phone: i.json.Phone || null,\n    service: i.json.Service,\n    timezone: i.json.Timezone,\n    status: i.json.Status,\n    start: i.json.Start,\n    createdAt: i.json['Created At'],\n    reminder24hSent: i.json['Reminder 24h Sent'],\n    reminder1hSent: i.json['Reminder 1h Sent'],\n  }));\n\nreturn remindersDue(appointments, new Date()).map((a) => {\n  const when = formatLocal(a.start, a.timezone);\n  const subject = a.kind === '1h'\n    ? `Starting soon: your ${a.service} at ${when}`\n    : `Reminder: your ${a.service} is tomorrow, ${when}`;\n  const sms = a.kind === '1h'\n    ? `Hi ${a.name}, your ${a.service} starts in under an hour (${when}). Ref ${a.appointmentId}`\n    : `Hi ${a.name}, reminder: your ${a.service} is on ${when}. Ref ${a.appointmentId}`;\n  return { json: { ...a, when, subject, sms } };\n});\n"
+      }
+    },
+    {
+      "id": "n104",
+      "name": "Send a Reminder?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        660,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "Send a Reminder?-c",
+              "leftValue": "={{ $json.kind }}",
+              "operator": {
+                "type": "string",
+                "operation": "notEquals"
+              },
+              "rightValue": "skip-24h"
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "n105",
+      "name": "Send Reminder Email",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        880,
+        200
+      ],
+      "parameters": {
+        "fromEmail": "={{ $env.FROM_EMAIL }}",
+        "toEmail": "={{ $json.email }}",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "html",
+        "html": "=<p>Hi {{ $json.name }},</p>\n<p>{{ $json.kind === '1h' ? 'Your appointment starts in under an hour.' : 'A quick reminder about your appointment tomorrow.' }}</p>\n<ul>\n  <li><strong>What:</strong> {{ $json.service }}</li>\n  <li><strong>When:</strong> {{ $json.when }}</li>\n  <li><strong>Reference:</strong> {{ $json.appointmentId }}</li>\n</ul>\n<p>Need to change it? Reply to this email.</p>",
+        "options": {}
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "smtp": {
+          "id": "REPLACE_ME",
+          "name": "SMTP account"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "n106",
+      "name": "Mark Reminder Sent",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [
+        1100,
+        300
+      ],
+      "parameters": {
+        "operation": "update",
+        "base": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $env.AIRTABLE_BASE_ID }}"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $env.AIRTABLE_APPOINTMENTS_TABLE_ID }}"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{ $('Decide Reminders').item.json.recordId }}",
+            "Reminder 24h Sent": "={{ $('Decide Reminders').item.json.setReminder24hSent }}",
+            "Reminder 1h Sent": "={{ $('Decide Reminders').item.json.setReminder1hSent }}"
+          },
+          "matchingColumns": [
+            "id"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "Reminder 24h Sent",
+              "displayName": "Reminder 24h Sent",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "boolean",
+              "removed": false
+            },
+            {
+              "id": "Reminder 1h Sent",
+              "displayName": "Reminder 1h Sent",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "boolean",
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": true,
+          "convertFieldsToString": false
+        },
+        "options": {
+          "typecast": true
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "REPLACE_ME",
+          "name": "Airtable account"
+        }
+      }
+    },
+    {
+      "id": "n107",
+      "name": "Send SMS Too?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1320,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "Send SMS Too?-c",
+              "leftValue": "={{ $('Decide Reminders').item.json.kind !== 'skip-24h' && !!$('Decide Reminders').item.json.phone && $env.SMS_ENABLED === 'true' }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "n108",
+      "name": "Send Reminder SMS",
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 1,
+      "position": [
+        1540,
+        200
+      ],
+      "parameters": {
+        "operation": "send",
+        "from": "={{ $env.TWILIO_FROM_NUMBER }}",
+        "to": "={{ $('Decide Reminders').item.json.phone }}",
+        "message": "={{ $('Decide Reminders').item.json.sms }}",
+        "options": {}
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "twilioApi": {
+          "id": "REPLACE_ME",
+          "name": "Twilio account"
+        }
+      }
+    },
+    {
+      "id": "n109",
+      "name": "Alert: Reminder Failed",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1100,
+        480
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: `:warning: ${$('Decide Reminders').item.json.kind} reminder email failed for ${$('Decide Reminders').item.json.appointmentId} (${$('Decide Reminders').item.json.email}). It will be retried on the next run.` }) }}",
+        "options": {}
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Every 15 Minutes": {
+      "main": [
+        [
+          {
+            "node": "Upcoming Appointments (25h)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upcoming Appointments (25h)": {
+      "main": [
+        [
+          {
+            "node": "Decide Reminders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decide Reminders": {
+      "main": [
+        [
+          {
+            "node": "Send a Reminder?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send a Reminder?": {
+      "main": [
+        [
+          {
+            "node": "Send Reminder Email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark Reminder Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Reminder Email": {
+      "main": [
+        [
+          {
+            "node": "Mark Reminder Sent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Alert: Reminder Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Reminder Sent": {
+      "main": [
+        [
+          {
+            "node": "Send SMS Too?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send SMS Too?": {
+      "main": [
+        [
+          {
+            "node": "Send Reminder SMS",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "active": false
+}

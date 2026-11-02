@@ -1,0 +1,647 @@
+{
+  "name": "Appointments: Book",
+  "nodes": [
+    {
+      "id": "n1",
+      "name": "Booking Request",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "appointments/book",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "webhookId": "appointments-book"
+    },
+    {
+      "id": "n2",
+      "name": "Validate Booking",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// ---- logic from code/validate-booking.js (unit tested in test/) ----\n// Validates and normalises a booking request.\n//\n// Pure function, no dependencies: unit tested in test/, and injected verbatim\n// into the \"Validate Booking\" Code node by scripts/build-workflows.js.\n//\n// Times: the request must carry an explicit UTC offset (\"2026-11-05T14:00:00+01:00\"\n// or \"...Z\"). A bare \"2026-11-05T14:00\" is rejected, because the server would\n// otherwise guess the timezone and the client could arrive an hour off.\n// Everything is stored and compared in UTC; the client's IANA timezone is kept\n// only so messages can show their local time.\n\nconst MIN_LEAD_MINUTES = 15;\nconst DEFAULT_DURATION = 30;\nconst MIN_DURATION = 15;\nconst MAX_DURATION = 240;\nconst EMAIL_RE = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/;\nconst E164_RE = /^\\+[1-9]\\d{7,14}$/;\nconst OFFSET_RE = /(Z|[+-]\\d{2}:\\d{2})$/;\n\nfunction isValidTimeZone(tz) {\n  try {\n    new Intl.DateTimeFormat('en-GB', { timeZone: tz });\n    return true;\n  } catch (e) {\n    return false;\n  }\n}\n\nfunction newAppointmentId(now, rand) {\n  const r = Math.floor((rand === undefined ? Math.random() : rand) * 36 ** 4)\n    .toString(36)\n    .padStart(4, '0');\n  return `APT-${now.getTime().toString(36).toUpperCase()}-${r.toUpperCase()}`;\n}\n\nfunction validateBooking(body, now) {\n  const b = body || {};\n  const errors = [];\n  const str = (v) => (typeof v === 'string' ? v.trim() : '');\n\n  const name = str(b.name);\n  const email = str(b.email).toLowerCase();\n  const phone = str(b.phone).replace(/[\\s-]/g, '');\n  const service = str(b.service) || 'Consultation';\n  const timezone = str(b.timezone) || 'Africa/Lagos';\n  const startRaw = str(b.start);\n  const duration = b.durationMins === undefined ? DEFAULT_DURATION : Number(b.durationMins);\n\n  if (!name) errors.push('name is required');\n  if (!EMAIL_RE.test(email)) errors.push('email is missing or invalid');\n  if (phone && !E164_RE.test(phone)) errors.push('phone must be in international format, e.g. +2348012345678');\n  if (!isValidTimeZone(timezone)) errors.push(`timezone \"${timezone}\" is not a valid IANA timezone`);\n\n  let start = null;\n  if (!startRaw) {\n    errors.push('start is required');\n  } else if (!OFFSET_RE.test(startRaw)) {\n    errors.push('start must include a UTC offset, e.g. 2026-11-05T14:00:00+01:00');\n  } else {\n    start = new Date(startRaw);\n    if (isNaN(start.getTime())) {\n      errors.push('start is not a valid date');\n      start = null;\n    } else if (start.getTime() < now.getTime() + MIN_LEAD_MINUTES * 60000) {\n      errors.push(`start must be at least ${MIN_LEAD_MINUTES} minutes in the future`);\n    }\n  }\n\n  if (!Number.isInteger(duration) || duration < MIN_DURATION || duration > MAX_DURATION) {\n    errors.push(`durationMins must be a whole number between ${MIN_DURATION} and ${MAX_DURATION}`);\n  }\n\n  if (errors.length) return { ok: false, errors };\n\n  const end = new Date(start.getTime() + duration * 60000);\n  return {\n    ok: true,\n    booking: {\n      appointmentId: newAppointmentId(now),\n      name,\n      email,\n      phone: phone || null,\n      service,\n      timezone,\n      durationMins: duration,\n      startUtc: start.toISOString(),\n      endUtc: end.toISOString(),\n      createdAt: now.toISOString(),\n    },\n  };\n}\n\n// ---- n8n wrapper ----\nreturn [{ json: validateBooking($input.first().json.body, new Date()) }];\n"
+      }
+    },
+    {
+      "id": "n3",
+      "name": "Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        440,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "Valid?-c",
+              "leftValue": "={{ $json.ok }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "n4",
+      "name": "Respond 400: Invalid",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        660,
+        480
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: false, errors: $json.errors }) }}",
+        "options": {
+          "responseCode": 400
+        }
+      }
+    },
+    {
+      "id": "n5",
+      "name": "Check Availability",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.3,
+      "position": [
+        660,
+        200
+      ],
+      "parameters": {
+        "resource": "calendar",
+        "operation": "availability",
+        "calendar": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $env.GOOGLE_CALENDAR_ID }}"
+        },
+        "timeMin": "={{ $('Validate Booking').first().json.booking.startUtc }}",
+        "timeMax": "={{ $('Validate Booking').first().json.booking.endUtc }}",
+        "options": {
+          "outputFormat": "availability"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Calendar account"
+        }
+      }
+    },
+    {
+      "id": "n6",
+      "name": "Slot Free?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        880,
+        200
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "Slot Free?-c",
+              "leftValue": "={{ $json.available }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "n7",
+      "name": "Respond 409: Slot Taken",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1100,
+        380
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: false, errors: ['That time is already booked. Please pick another slot.'] }) }}",
+        "options": {
+          "responseCode": 409
+        }
+      }
+    },
+    {
+      "id": "n8",
+      "name": "Create Calendar Event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.3,
+      "position": [
+        1100,
+        100
+      ],
+      "parameters": {
+        "calendar": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $env.GOOGLE_CALENDAR_ID }}"
+        },
+        "start": "={{ $('Validate Booking').first().json.booking.startUtc }}",
+        "end": "={{ $('Validate Booking').first().json.booking.endUtc }}",
+        "useDefaultReminders": false,
+        "additionalFields": {
+          "summary": "={{ $('Validate Booking').first().json.booking.service }}: {{ $('Validate Booking').first().json.booking.name }}",
+          "description": "=Booked via automation.\nAppointment ID: {{ $('Validate Booking').first().json.booking.appointmentId }}\nClient: {{ $('Validate Booking').first().json.booking.name }} <{{ $('Validate Booking').first().json.booking.email }}>\nPhone: {{ $('Validate Booking').first().json.booking.phone || 'n/a' }}"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Calendar account"
+        }
+      }
+    },
+    {
+      "id": "n9",
+      "name": "Save Appointment",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [
+        1320,
+        0
+      ],
+      "parameters": {
+        "operation": "create",
+        "base": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $env.AIRTABLE_BASE_ID }}"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $env.AIRTABLE_APPOINTMENTS_TABLE_ID }}"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Appointment ID": "={{ $('Validate Booking').first().json.booking.appointmentId }}",
+            "Name": "={{ $('Validate Booking').first().json.booking.name }}",
+            "Email": "={{ $('Validate Booking').first().json.booking.email }}",
+            "Phone": "={{ $('Validate Booking').first().json.booking.phone }}",
+            "Service": "={{ $('Validate Booking').first().json.booking.service }}",
+            "Start": "={{ $('Validate Booking').first().json.booking.startUtc }}",
+            "End": "={{ $('Validate Booking').first().json.booking.endUtc }}",
+            "Duration (mins)": "={{ $('Validate Booking').first().json.booking.durationMins }}",
+            "Timezone": "={{ $('Validate Booking').first().json.booking.timezone }}",
+            "Status": "Confirmed",
+            "Calendar Event ID": "={{ $json.id }}",
+            "Created At": "={{ $('Validate Booking').first().json.booking.createdAt }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "Appointment ID",
+              "displayName": "Appointment ID",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "Name",
+              "displayName": "Name",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "Email",
+              "displayName": "Email",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "Phone",
+              "displayName": "Phone",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "Service",
+              "displayName": "Service",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "Start",
+              "displayName": "Start",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "End",
+              "displayName": "End",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "Duration (mins)",
+              "displayName": "Duration (mins)",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "number",
+              "removed": false
+            },
+            {
+              "id": "Timezone",
+              "displayName": "Timezone",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "Status",
+              "displayName": "Status",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "Calendar Event ID",
+              "displayName": "Calendar Event ID",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "Created At",
+              "displayName": "Created At",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": true,
+          "convertFieldsToString": false
+        },
+        "options": {
+          "typecast": true
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "REPLACE_ME",
+          "name": "Airtable account"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "n10",
+      "name": "Send Confirmation",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1540,
+        -100
+      ],
+      "parameters": {
+        "fromEmail": "={{ $env.FROM_EMAIL }}",
+        "toEmail": "={{ $('Validate Booking').first().json.booking.email }}",
+        "subject": "=Confirmed: {{ $('Validate Booking').first().json.booking.service }} on {{ new Date($('Validate Booking').first().json.booking.startUtc).toLocaleString('en-GB', { timeZone: $('Validate Booking').first().json.booking.timezone, dateStyle: 'full', timeStyle: 'short' }) }}",
+        "emailFormat": "html",
+        "html": "=<p>Hi {{ $('Validate Booking').first().json.booking.name }},</p>\n<p>Your <strong>{{ $('Validate Booking').first().json.booking.service }}</strong> is confirmed for\n<strong>{{ new Date($('Validate Booking').first().json.booking.startUtc).toLocaleString('en-GB', { timeZone: $('Validate Booking').first().json.booking.timezone, dateStyle: 'full', timeStyle: 'short' }) }}</strong>\n({{ $('Validate Booking').first().json.booking.timezone }}), {{ $('Validate Booking').first().json.booking.durationMins }} minutes.</p>\n<p>We'll remind you the day before and an hour before.</p>\n<p>Need to change it? Reply to this email and quote <strong>{{ $('Validate Booking').first().json.booking.appointmentId }}</strong>.</p>",
+        "options": {}
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "smtp": {
+          "id": "REPLACE_ME",
+          "name": "SMTP account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "n11",
+      "name": "Respond 201: Booked",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1760,
+        -100
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, appointmentId: $('Validate Booking').first().json.booking.appointmentId, start: $('Validate Booking').first().json.booking.startUtc, end: $('Validate Booking').first().json.booking.endUtc }) }}",
+        "options": {
+          "responseCode": 201
+        }
+      }
+    },
+    {
+      "id": "n12",
+      "name": "Undo Calendar Event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.3,
+      "position": [
+        1540,
+        140
+      ],
+      "parameters": {
+        "operation": "delete",
+        "calendar": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $env.GOOGLE_CALENDAR_ID }}"
+        },
+        "eventId": "={{ $('Create Calendar Event').first().json.id }}",
+        "options": {}
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Calendar account"
+        }
+      }
+    },
+    {
+      "id": "n13",
+      "name": "Alert: Booking Failed",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1540,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: `:rotating_light: Booking failed for ${$('Validate Booking').first().json.booking.name} (${$('Validate Booking').first().json.booking.email}) at ${$('Validate Booking').first().json.booking.startUtc}. Nothing was saved; client was told to retry.` }) }}",
+        "options": {}
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "n14",
+      "name": "Respond 502: Try Again",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1760,
+        300
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: false, errors: ['We could not complete your booking. Please try again in a minute.'] }) }}",
+        "options": {
+          "responseCode": 502
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Booking Request": {
+      "main": [
+        [
+          {
+            "node": "Validate Booking",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Booking": {
+      "main": [
+        [
+          {
+            "node": "Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Valid?": {
+      "main": [
+        [
+          {
+            "node": "Check Availability",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond 400: Invalid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Availability": {
+      "main": [
+        [
+          {
+            "node": "Slot Free?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Alert: Booking Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slot Free?": {
+      "main": [
+        [
+          {
+            "node": "Create Calendar Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond 409: Slot Taken",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Calendar Event": {
+      "main": [
+        [
+          {
+            "node": "Save Appointment",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Alert: Booking Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Appointment": {
+      "main": [
+        [
+          {
+            "node": "Send Confirmation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Undo Calendar Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Confirmation": {
+      "main": [
+        [
+          {
+            "node": "Respond 201: Booked",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Undo Calendar Event": {
+      "main": [
+        [
+          {
+            "node": "Alert: Booking Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert: Booking Failed": {
+      "main": [
+        [
+          {
+            "node": "Respond 502: Try Again",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "active": false
+}

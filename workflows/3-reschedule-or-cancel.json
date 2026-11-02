@@ -1,0 +1,747 @@
+{
+  "name": "Appointments: Reschedule or Cancel",
+  "nodes": [
+    {
+      "id": "n201",
+      "name": "Change Request",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "appointments/change",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "webhookId": "appointments-change"
+    },
+    {
+      "id": "n202",
+      "name": "Find Appointment",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [
+        220,
+        300
+      ],
+      "parameters": {
+        "operation": "search",
+        "base": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $env.AIRTABLE_BASE_ID }}"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $env.AIRTABLE_APPOINTMENTS_TABLE_ID }}"
+        },
+        "filterByFormula": "={Appointment ID} = '{{ String($json.body.appointmentId || '').replace(/[^A-Za-z0-9_-]/g, '') }}'",
+        "returnAll": false,
+        "limit": 1,
+        "options": {}
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "REPLACE_ME",
+          "name": "Airtable account"
+        }
+      },
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "n203",
+      "name": "Plan Change",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// ---- logic from code/plan-change.js (unit tested in test/) ----\n// Validates a reschedule or cancel request against the stored appointment\n// and returns exactly what to change.\n//\n// Pure function: unit tested in test/, injected verbatim into the\n// \"Plan Change\" Code node by scripts/build-workflows.js.\n\nconst MIN_LEAD_MINUTES = 15;\nconst OFFSET_RE = /(Z|[+-]\\d{2}:\\d{2})$/;\n\nfunction planChange(request, appointment, now) {\n  const r = request || {};\n  const action = typeof r.action === 'string' ? r.action.trim().toLowerCase() : '';\n\n  if (!appointment) return { ok: false, httpStatus: 404, error: 'appointment not found' };\n  if (action !== 'cancel' && action !== 'reschedule') {\n    return { ok: false, httpStatus: 400, error: 'action must be \"cancel\" or \"reschedule\"' };\n  }\n  if (appointment.status === 'Cancelled') {\n    return { ok: false, httpStatus: 409, error: 'appointment is already cancelled' };\n  }\n  if (new Date(appointment.start).getTime() <= now.getTime()) {\n    return { ok: false, httpStatus: 409, error: 'appointment has already started or passed' };\n  }\n\n  if (action === 'cancel') {\n    return {\n      ok: true,\n      action,\n      update: { Status: 'Cancelled', 'Last Change': `Cancelled ${now.toISOString()}` },\n    };\n  }\n\n  const raw = typeof r.newStart === 'string' ? r.newStart.trim() : '';\n  if (!raw || !OFFSET_RE.test(raw)) {\n    return { ok: false, httpStatus: 400, error: 'newStart is required and must include a UTC offset' };\n  }\n  const newStart = new Date(raw);\n  if (isNaN(newStart.getTime())) return { ok: false, httpStatus: 400, error: 'newStart is not a valid date' };\n  if (newStart.getTime() < now.getTime() + MIN_LEAD_MINUTES * 60000) {\n    return { ok: false, httpStatus: 400, error: `newStart must be at least ${MIN_LEAD_MINUTES} minutes in the future` };\n  }\n  if (newStart.getTime() === new Date(appointment.start).getTime()) {\n    return { ok: false, httpStatus: 409, error: 'newStart is the same as the current start' };\n  }\n\n  const durationMs = new Date(appointment.end).getTime() - new Date(appointment.start).getTime();\n  const newEnd = new Date(newStart.getTime() + durationMs);\n\n  return {\n    ok: true,\n    action,\n    newStartUtc: newStart.toISOString(),\n    newEndUtc: newEnd.toISOString(),\n    update: {\n      Start: newStart.toISOString(),\n      End: newEnd.toISOString(),\n      Status: 'Confirmed',\n      // New time, new reminder cycle.\n      'Reminder 24h Sent': false,\n      'Reminder 1h Sent': false,\n      'Last Change': `Rescheduled ${now.toISOString()} (was ${new Date(appointment.start).toISOString()})`,\n    },\n  };\n}\n\n/**\n * Decide what a Google Calendar change means for the Airtable record.\n * Returns null when Airtable already matches. This is what stops a sync loop:\n * when this system moves an event, the calendar trigger fires, finds Airtable\n * already up to date, and does nothing.\n */\nfunction planCalendarSync(event, appointment) {\n  if (!appointment) return null;\n  if (event.cancelled) {\n    if (appointment.status === 'Cancelled') return null;\n    return { Status: 'Cancelled', 'Last Change': 'Cancelled in Google Calendar' };\n  }\n  const start = new Date(event.start).toISOString();\n  const end = new Date(event.end).toISOString();\n  const sameStart = new Date(appointment.start).toISOString() === start;\n  const sameEnd = new Date(appointment.end).toISOString() === end;\n  if (sameStart && sameEnd) return null;\n  const update = { Start: start, End: end, 'Last Change': 'Moved in Google Calendar' };\n  if (!sameStart) {\n    update['Reminder 24h Sent'] = false;\n    update['Reminder 1h Sent'] = false;\n  }\n  return update;\n}\n\n// ---- n8n wrapper ----\nconst rec = $input.first().json;\nif (rec.error) {\n  return [{ json: { ok: false, httpStatus: 502, error: 'Could not look up the appointment. Nothing was changed; please try again.' } }];\n}\nconst appointment = rec.id\n  ? { status: rec.Status, start: rec.Start, end: rec.End }\n  : null;\nconst plan = planChange($('Change Request').first().json.body, appointment, new Date());\nreturn [{ json: {\n  ...plan,\n  recordId: rec.id || null,\n  eventId: rec['Calendar Event ID'] || null,\n  appointmentId: rec['Appointment ID'] || null,\n  name: rec.Name || null,\n  email: rec.Email || null,\n  service: rec.Service || null,\n  timezone: rec.Timezone || 'Africa/Lagos',\n} }];\n"
+      }
+    },
+    {
+      "id": "n204",
+      "name": "Allowed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        660,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "Allowed?-c",
+              "leftValue": "={{ $json.ok }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "n205",
+      "name": "Respond: Refused",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        880,
+        480
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: false, error: $json.error }) }}",
+        "options": {
+          "responseCode": "={{ $json.httpStatus }}"
+        }
+      }
+    },
+    {
+      "id": "n206",
+      "name": "Cancel?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        880,
+        200
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "Cancel?-c",
+              "leftValue": "={{ $json.action }}",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              },
+              "rightValue": "cancel"
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "n207",
+      "name": "Delete Calendar Event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.3,
+      "position": [
+        1100,
+        40
+      ],
+      "parameters": {
+        "operation": "delete",
+        "calendar": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $env.GOOGLE_CALENDAR_ID }}"
+        },
+        "eventId": "={{ $('Plan Change').first().json.eventId }}",
+        "options": {
+          "sendUpdates": "none"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Calendar account"
+        }
+      }
+    },
+    {
+      "id": "n208",
+      "name": "Mark Cancelled",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [
+        1320,
+        40
+      ],
+      "parameters": {
+        "operation": "update",
+        "base": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $env.AIRTABLE_BASE_ID }}"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $env.AIRTABLE_APPOINTMENTS_TABLE_ID }}"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{ $('Plan Change').first().json.recordId }}",
+            "Status": "Cancelled",
+            "Last Change": "={{ $('Plan Change').first().json.update['Last Change'] }}"
+          },
+          "matchingColumns": [
+            "id"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "Status",
+              "displayName": "Status",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "Last Change",
+              "displayName": "Last Change",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": true,
+          "convertFieldsToString": false
+        },
+        "options": {
+          "typecast": true
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "REPLACE_ME",
+          "name": "Airtable account"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "n209",
+      "name": "Send Cancellation",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1540,
+        40
+      ],
+      "parameters": {
+        "fromEmail": "={{ $env.FROM_EMAIL }}",
+        "toEmail": "={{ $('Plan Change').first().json.email }}",
+        "subject": "=Cancelled: your {{ $('Plan Change').first().json.service }}",
+        "emailFormat": "html",
+        "html": "=<p>Hi {{ $('Plan Change').first().json.name }},</p><p>Your {{ $('Plan Change').first().json.service }} (ref {{ $('Plan Change').first().json.appointmentId }}) has been cancelled. Reply to this email to book a new time.</p>",
+        "options": {}
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "smtp": {
+          "id": "REPLACE_ME",
+          "name": "SMTP account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "n210",
+      "name": "Respond 200: Cancelled",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1760,
+        40
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, appointmentId: $('Plan Change').first().json.appointmentId, status: 'Cancelled' }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      }
+    },
+    {
+      "id": "n211",
+      "name": "Move Calendar Event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.3,
+      "position": [
+        1100,
+        260
+      ],
+      "parameters": {
+        "operation": "update",
+        "calendar": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $env.GOOGLE_CALENDAR_ID }}"
+        },
+        "eventId": "={{ $('Plan Change').first().json.eventId }}",
+        "updateFields": {
+          "start": "={{ $('Plan Change').first().json.newStartUtc }}",
+          "end": "={{ $('Plan Change').first().json.newEndUtc }}"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Calendar account"
+        }
+      }
+    },
+    {
+      "id": "n212",
+      "name": "Save New Time",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [
+        1320,
+        200
+      ],
+      "parameters": {
+        "operation": "update",
+        "base": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $env.AIRTABLE_BASE_ID }}"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $env.AIRTABLE_APPOINTMENTS_TABLE_ID }}"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{ $('Plan Change').first().json.recordId }}",
+            "Start": "={{ $('Plan Change').first().json.update.Start }}",
+            "End": "={{ $('Plan Change').first().json.update.End }}",
+            "Status": "Confirmed",
+            "Reminder 24h Sent": "={{ false }}",
+            "Reminder 1h Sent": "={{ false }}",
+            "Last Change": "={{ $('Plan Change').first().json.update['Last Change'] }}"
+          },
+          "matchingColumns": [
+            "id"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "Start",
+              "displayName": "Start",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "End",
+              "displayName": "End",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "Status",
+              "displayName": "Status",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "Reminder 24h Sent",
+              "displayName": "Reminder 24h Sent",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "boolean",
+              "removed": false
+            },
+            {
+              "id": "Reminder 1h Sent",
+              "displayName": "Reminder 1h Sent",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "boolean",
+              "removed": false
+            },
+            {
+              "id": "Last Change",
+              "displayName": "Last Change",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": true,
+          "convertFieldsToString": false
+        },
+        "options": {
+          "typecast": true
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "REPLACE_ME",
+          "name": "Airtable account"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "n213",
+      "name": "Send New Time",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1540,
+        200
+      ],
+      "parameters": {
+        "fromEmail": "={{ $env.FROM_EMAIL }}",
+        "toEmail": "={{ $('Plan Change').first().json.email }}",
+        "subject": "=Rescheduled: your {{ $('Plan Change').first().json.service }} is now {{ new Date($('Plan Change').first().json.newStartUtc).toLocaleString('en-GB', { timeZone: $('Plan Change').first().json.timezone, dateStyle: 'full', timeStyle: 'short' }) }}",
+        "emailFormat": "html",
+        "html": "=<p>Hi {{ $('Plan Change').first().json.name }},</p><p>Your {{ $('Plan Change').first().json.service }} (ref {{ $('Plan Change').first().json.appointmentId }}) has moved to <strong>{{ new Date($('Plan Change').first().json.newStartUtc).toLocaleString('en-GB', { timeZone: $('Plan Change').first().json.timezone, dateStyle: 'full', timeStyle: 'short' }) }}</strong> ({{ $('Plan Change').first().json.timezone }}). You'll get fresh reminders for the new time.</p>",
+        "options": {}
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "smtp": {
+          "id": "REPLACE_ME",
+          "name": "SMTP account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "n214",
+      "name": "Respond 200: Rescheduled",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1760,
+        200
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, appointmentId: $('Plan Change').first().json.appointmentId, start: $('Plan Change').first().json.newStartUtc, end: $('Plan Change').first().json.newEndUtc }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      }
+    },
+    {
+      "id": "n215",
+      "name": "Respond 502: Calendar Error",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1320,
+        380
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: false, error: 'Could not update the calendar. Nothing was changed; please try again.' }) }}",
+        "options": {
+          "responseCode": 502
+        }
+      }
+    },
+    {
+      "id": "n216",
+      "name": "Alert: Record Not Saved",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1540,
+        380
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: `:warning: ${$('Plan Change').first().json.action} of ${$('Plan Change').first().json.appointmentId} applied to Google Calendar but the Airtable update failed. Calendar Sync should reconcile it within 5 minutes; check it did.` }) }}",
+        "options": {}
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "n217",
+      "name": "Respond 202: Saved to Calendar",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1760,
+        380
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, appointmentId: $('Plan Change').first().json.appointmentId, note: 'Change applied to the calendar; records are catching up.' }) }}",
+        "options": {
+          "responseCode": 202
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Change Request": {
+      "main": [
+        [
+          {
+            "node": "Find Appointment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Appointment": {
+      "main": [
+        [
+          {
+            "node": "Plan Change",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Plan Change": {
+      "main": [
+        [
+          {
+            "node": "Allowed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Allowed?": {
+      "main": [
+        [
+          {
+            "node": "Cancel?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond: Refused",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cancel?": {
+      "main": [
+        [
+          {
+            "node": "Delete Calendar Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Move Calendar Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delete Calendar Event": {
+      "main": [
+        [
+          {
+            "node": "Mark Cancelled",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Cancelled": {
+      "main": [
+        [
+          {
+            "node": "Send Cancellation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Alert: Record Not Saved",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Cancellation": {
+      "main": [
+        [
+          {
+            "node": "Respond 200: Cancelled",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Move Calendar Event": {
+      "main": [
+        [
+          {
+            "node": "Save New Time",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond 502: Calendar Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save New Time": {
+      "main": [
+        [
+          {
+            "node": "Send New Time",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Alert: Record Not Saved",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert: Record Not Saved": {
+      "main": [
+        [
+          {
+            "node": "Respond 202: Saved to Calendar",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send New Time": {
+      "main": [
+        [
+          {
+            "node": "Respond 200: Rescheduled",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "active": false
+}

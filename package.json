@@ -1,0 +1,13 @@
+{
+  "name": "appointment-lifecycle-automation",
+  "version": "1.0.0",
+  "description": "n8n + Airtable + Google Calendar appointment automation: validated booking with conflict checks, 24h/1h reminders, reschedule/cancel, and two-way calendar sync.",
+  "private": true,
+  "license": "MIT",
+  "author": "Lucas Ifeoluwa",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "build": "node scripts/build-workflows.js"
+  }
+}
